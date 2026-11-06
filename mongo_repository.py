@@ -1,23 +1,30 @@
-"""=== TO COMPLETE ===
+"""MongoDB implementation of the product repository contract.
 
-This file is the implementation gap: 15 of the 17 methods are stubs
-(``ensure_indexes`` is a deliberate no-op, ``create_products`` is provided).
-
-The ``InMemoryProductRepository`` in ``memory_repository.py`` is the reference
-behavior. Implement this repository on MongoDB.
-
-No application-level caching, no Python tricks: speed must come from the
-database.
+Products store stable category/brand references. Their names are resolved from
+entity collections on reads, so renaming an entity does not rewrite products.
+Filtering, sorting, pagination and statistics are performed by MongoDB.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import uuid
+from dataclasses import replace
 
-from pymongo import MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError
 
-from models import Brand, CatalogStats, Category, Product, ProductPage, ProductQuery
-from repository import ProductRepository
+from models import (
+    Brand,
+    CatalogStats,
+    Category,
+    CategoryStats,
+    Product,
+    ProductPage,
+    ProductQuery,
+)
+from repository import EntityNotFoundError, ProductRepository
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,24 +32,12 @@ LOGGER = logging.getLogger(__name__)
 # test fixtures and seeder import this to know where to clean up. Deliberately
 # NOT a performance hint (no mention of indexes, $text, keyset, projections).
 PRODUCT_COLLECTION_NAME = "product"
+CATEGORY_COLLECTION_NAME = "category"
+BRAND_COLLECTION_NAME = "brand"
 
 
 class MongoProductRepository(ProductRepository):
-    """MongoDB-backed repository. The 17 methods below are the same contract as
-    ``InMemoryProductRepository``, implemented on MongoDB.
-
-    ``__init__`` receives the URI and DB name from the factory; it does NOT
-    read environment variables. 15 of the 17 methods currently raise
-    ``NotImplementedError`` (``ensure_indexes`` is a deliberate no-op,
-    ``create_products`` is provided).
-
-    The member docstrings state the contract ONLY. They deliberately contain
-    NO hints about indexes, ``$text``, keyset pagination, or projections.
-
-    Name matching follows the same convention: every name comparison is
-    case-sensitive (``Books`` and ``books`` are two distinct entities); the
-    only case-insensitive match is ``ProductQuery.search_text``.
-    """
+    """MongoDB-backed implementation of the shared repository contract."""
 
     def __init__(self, uri: str, db_name: str) -> None:
         self._uri = uri
@@ -50,11 +45,95 @@ class MongoProductRepository(ProductRepository):
         # Lazy client: no connection is opened until an operation actually runs.
         self._client = MongoClient(uri)
         self._db = self._client[db_name]
+        self._products = self._db[PRODUCT_COLLECTION_NAME]
+        self._categories = self._db[CATEGORY_COLLECTION_NAME]
+        self._brands = self._db[BRAND_COLLECTION_NAME]
+        self._category_names = self._db["category_names"]
+        self._brand_names = self._db["brand_names"]
 
     def close(self) -> None:
         """Release backend resources. Called once at shutdown."""
         LOGGER.info("close()")
-        raise NotImplementedError("TODO: implement 'close' using MongoDB")
+        self._client.close()
+
+    def _get_or_create_entity(self, name: str, kind: str) -> Category | Brand:
+        if kind == "category":
+            collection, names, factory = self._categories, self._category_names, Category
+        else:
+            collection, names, factory = self._brands, self._brand_names, Brand
+
+        record = names.find_one({"_id": name}, {"entity_id": 1})
+        if record is not None:
+            return factory(id=record["entity_id"], name=name)
+
+        entity_id = uuid.uuid4().hex
+        collection.insert_one({"_id": entity_id, "name": name})
+        try:
+            # _id is unique: two simultaneous creates cannot bind one name
+            # to two different entities.
+            names.insert_one({"_id": name, "entity_id": entity_id})
+        except DuplicateKeyError:
+            collection.delete_one({"_id": entity_id})
+            existing = names.find_one({"_id": name}, {"entity_id": 1})
+            return factory(id=existing["entity_id"], name=name)
+        return factory(id=entity_id, name=name)
+
+    @staticmethod
+    def _document(product: Product, product_id: str, category, brand) -> dict:
+        return {
+            "_id": product_id,
+            "name": product.name,
+            "description": product.description,
+            "category_id": category.id if category is not None else None,
+            "brand_id": brand.id if brand is not None else None,
+            "price": product.price,
+            "stock": product.stock,
+            "rating": product.rating,
+            "units_sold": product.units_sold,
+            "created_at": product.created_at,
+        }
+
+    @staticmethod
+    def _product_from_document(doc: dict) -> Product:
+        category_docs = doc.get("_joined_category", [])
+        brand_docs = doc.get("_joined_brand", [])
+        category = (
+            Category(id=category_docs[0]["_id"], name=category_docs[0]["name"])
+            if category_docs else None
+        )
+        brand = (
+            Brand(id=brand_docs[0]["_id"], name=brand_docs[0]["name"])
+            if brand_docs else None
+        )
+        return Product(
+            id=doc["_id"],
+            name=doc["name"],
+            description=doc["description"],
+            category=category,
+            brand=brand,
+            price=doc["price"],
+            stock=doc["stock"],
+            rating=doc["rating"],
+            units_sold=doc["units_sold"],
+            created_at=doc["created_at"],
+        )
+
+    @staticmethod
+    def _joins() -> list[dict]:
+        return [
+            {"$lookup": {
+                "from": CATEGORY_COLLECTION_NAME,
+                "localField": "category_id",
+                "foreignField": "_id",
+                "as": "_joined_category",
+            }},
+            {"$lookup": {
+                "from": BRAND_COLLECTION_NAME,
+                "localField": "brand_id",
+                "foreignField": "_id",
+                "as": "_joined_brand",
+            }},
+        ]
 
     def create_product(self, product: Product) -> Product:
         """Create a single product.
@@ -64,7 +143,17 @@ class MongoProductRepository(ProductRepository):
         auto-created on first sight of its name. Returns the stored product.
         """
         LOGGER.info("create_product(%r, %s, %d)", product.name, product.price, product.stock)
-        raise NotImplementedError("TODO: implement 'create_product' using MongoDB")
+        category = (
+            self._get_or_create_entity(product.category.name, "category")
+            if product.category is not None else None
+        )
+        brand = (
+            self._get_or_create_entity(product.brand.name, "brand")
+            if product.brand is not None else None
+        )
+        product_id = uuid.uuid4().hex
+        self._products.insert_one(self._document(product, product_id, category, brand))
+        return replace(product, id=product_id, category=category, brand=brand)
 
     def create_products(self, products: list[Product]) -> list[Product]:
         """Insert many products in one bulk call (the seed path).
@@ -75,8 +164,33 @@ class MongoProductRepository(ProductRepository):
         empty input returns an empty list.
         """
         LOGGER.info("create_products(%d)", len(products))
-        # Not required immediately. Can be implemented later.
-        return [self.create_product(product) for product in products]
+        if not products:
+            return []
+
+        # One entity creation/lookup per distinct name in this entire batch;
+        # one MongoDB insert_many call for the actual products.
+        categories = {
+            name: self._get_or_create_entity(name, "category")
+            for name in dict.fromkeys(
+                p.category.name for p in products if p.category is not None
+            )
+        }
+        brands = {
+            name: self._get_or_create_entity(name, "brand")
+            for name in dict.fromkeys(
+                p.brand.name for p in products if p.brand is not None
+            )
+        }
+        stored = []
+        documents = []
+        for product in products:
+            category = categories[product.category.name] if product.category is not None else None
+            brand = brands[product.brand.name] if product.brand is not None else None
+            product_id = uuid.uuid4().hex
+            documents.append(self._document(product, product_id, category, brand))
+            stored.append(replace(product, id=product_id, category=category, brand=brand))
+        self._products.insert_many(documents)
+        return stored
 
     def get_product(self, product_id: str) -> Product | None:
         """Return the product with ``product_id`` (entities materialized at fetch time).
@@ -84,7 +198,11 @@ class MongoProductRepository(ProductRepository):
         Never raises: an unknown or malformed id yields ``None``.
         """
         LOGGER.info("get_product(%r)", product_id)
-        raise NotImplementedError("TODO: implement 'get_product' using MongoDB")
+        records = self._products.aggregate(
+            [{"$match": {"_id": product_id}}, {"$limit": 1}, *self._joins()]
+        )
+        doc = next(records, None)
+        return self._product_from_document(doc) if doc is not None else None
 
     def update_product(self, product: Product) -> Product:
         """Fully replace the mutable fields of the stored product targeted by ``product.id``.
@@ -98,7 +216,27 @@ class MongoProductRepository(ProductRepository):
         product. Returns the updated product.
         """
         LOGGER.info("update_product(%r, %r)", product.id, product.name)
-        raise NotImplementedError("TODO: implement 'update_product' using MongoDB")
+        existing = self._products.find_one({"_id": product.id}, {"created_at": 1})
+        if existing is None:
+            raise EntityNotFoundError(f"product id {product.id!r} not found")
+
+        category = (
+            self._get_or_create_entity(product.category.name, "category")
+            if product.category is not None else None
+        )
+        brand = (
+            self._get_or_create_entity(product.brand.name, "brand")
+            if product.brand is not None else None
+        )
+        mutable = self._document(product, product.id, category, brand)
+        del mutable["_id"]
+        del mutable["created_at"]  # never overwrite the stored creation date
+        result = self._products.update_one({"_id": product.id}, {"$set": mutable})
+        if not result.matched_count:
+            raise EntityNotFoundError(f"product id {product.id!r} not found")
+        return replace(
+            product, created_at=existing["created_at"], category=category, brand=brand
+        )
 
     def list_products(self, query: ProductQuery) -> ProductPage:
         """Filter, sort and paginate products according to ``query``.
@@ -109,7 +247,57 @@ class MongoProductRepository(ProductRepository):
         name or description. Ties on ``sort_field`` are broken by ``id`` ascending.
         """
         LOGGER.info("list_products(%r)", query)
-        raise NotImplementedError("TODO: implement 'list_products' using MongoDB")
+        conditions = []
+        if query.category is not None:
+            category_ids = [
+                doc["_id"]
+                for doc in self._categories.find({"name": query.category}, {"_id": 1})
+            ]
+            conditions.append({"category_id": {"$in": category_ids}})
+        if query.brand is not None:
+            brand_ids = [
+                doc["_id"]
+                for doc in self._brands.find({"name": query.brand}, {"_id": 1})
+            ]
+            conditions.append({"brand_id": {"$in": brand_ids}})
+        if query.price_min is not None or query.price_max is not None:
+            bounds = {}
+            if query.price_min is not None:
+                bounds["$gte"] = query.price_min
+            if query.price_max is not None:
+                bounds["$lte"] = query.price_max
+            conditions.append({"price": bounds})
+        if query.min_rating is not None:
+            conditions.append({"rating": {"$gte": query.min_rating}})
+        if query.in_stock is True:
+            conditions.append({"stock": {"$gt": 0}})
+        elif query.in_stock is False:
+            conditions.append({"stock": 0})
+        if query.search_text is not None:
+            pattern = re.escape(query.search_text)
+            conditions.append({"$or": [
+                {"name": {"$regex": pattern, "$options": "i"}},
+                {"description": {"$regex": pattern, "$options": "i"}},
+            ]})
+
+        predicate = {"$and": conditions} if conditions else {}
+        total = self._products.count_documents(predicate)
+        page = max(1, query.page)
+        page_size = max(1, min(100, query.page_size))
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        direction = ASCENDING if query.sort_ascending else DESCENDING
+        pipeline = [
+            {"$match": predicate},
+            {"$sort": {query.sort_field: direction, "_id": ASCENDING}},
+            {"$skip": (page - 1) * page_size},
+            {"$limit": page_size},
+            *self._joins(),
+        ]
+        items = [self._product_from_document(doc) for doc in self._products.aggregate(pipeline)]
+        return ProductPage(
+            items=items, total=total, page=page,
+            page_size=page_size, total_pages=total_pages,
+        )
 
     def delete_product(self, product_id: str) -> None:
         """Delete the product with ``product_id``; returns ``None``.
@@ -117,7 +305,9 @@ class MongoProductRepository(ProductRepository):
         An unknown or malformed id raises ``repository.EntityNotFoundError``.
         """
         LOGGER.info("delete_product(%r)", product_id)
-        raise NotImplementedError("TODO: implement 'delete_product' using MongoDB")
+        result = self._products.delete_one({"_id": product_id})
+        if not result.deleted_count:
+            raise EntityNotFoundError(f"product id {product_id!r} not found")
 
     def get_stats(self) -> CatalogStats:
         """Return whole-catalog statistics.
@@ -130,13 +320,118 @@ class MongoProductRepository(ProductRepository):
         ``by_category`` (they still count in ``total`` / ``average_price``).
         """
         LOGGER.info("get_stats()")
-        raise NotImplementedError("TODO: implement 'get_stats' using MongoDB")
+        result = next(self._products.aggregate([{"$facet": {
+            "overall": [{"$group": {
+                "_id": None,
+                "total": {"$sum": 1},
+                "average_price": {"$avg": "$price"},
+            }}],
+            "categories": [
+                {"$match": {"category_id": {"$ne": None}}},
+                {"$group": {
+                    "_id": "$category_id",
+                    "count": {"$sum": 1},
+                    "sum_price": {"$sum": "$price"},
+                    "total_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
+                }},
+                {"$lookup": {
+                    "from": CATEGORY_COLLECTION_NAME,
+                    "localField": "_id", "foreignField": "_id", "as": "category",
+                }},
+                {"$unwind": "$category"},
+                # Different ids can share a name after a rename. Stats are
+                # grouped by the current name, not by entity id.
+                {"$group": {
+                    "_id": "$category.name",
+                    "count": {"$sum": "$count"},
+                    "sum_price": {"$sum": "$sum_price"},
+                    "total_value": {"$sum": "$total_value"},
+                }},
+                {"$project": {
+                    "count": 1,
+                    "average_price": {"$divide": ["$sum_price", "$count"]},
+                    "total_value": 1,
+                }},
+                {"$sort": {"_id": 1}},
+            ],
+        }}]), None)
+        overall = result["overall"]
+        if not overall:
+            return CatalogStats(total=0, average_price=0.0, by_category={})
+        categories = {
+            row["_id"]: CategoryStats(
+                count=row["count"],
+                average_price=row["average_price"],
+                total_value=row["total_value"],
+            )
+            for row in result["categories"]
+        }
+        return CatalogStats(
+            total=overall[0]["total"],
+            average_price=overall[0]["average_price"],
+            by_category=categories,
+        )
 
     def ensure_indexes(self) -> None:
         """Ensure backend indexes exist. Idempotent."""
         LOGGER.info("ensure_indexes()")
-        # Not required immediately. Can be implemented later.
-        pass
+        # Every tie must be ordered by _id ascending, including when sorting
+        # the primary field descending. Separate index directions are needed.
+        for field in ("name", "price", "rating", "units_sold", "created_at"):
+            for direction in (ASCENDING, DESCENDING):
+                self._products.create_index([(field, direction), ("_id", ASCENDING)])
+        self._products.create_index([("category_id", ASCENDING)])
+        self._products.create_index([("brand_id", ASCENDING)])
+        self._categories.create_index([("name", ASCENDING)])
+        self._brands.create_index([("name", ASCENDING)])
+        # category_names/brand_names already have unique _id indexes.
+
+    def _list_entities(self, kind: str) -> list[Category] | list[Brand]:
+        collection = self._categories if kind == "category" else self._brands
+        factory = Category if kind == "category" else Brand
+        # _id sorts ties deterministically; the name sort matches codepoint
+        # order under MongoDB's default simple collation.
+        return [
+            factory(id=row["_id"], name=row["name"])
+            for row in collection.find({}, {"name": 1}).sort([("name", 1), ("_id", 1)])
+        ]
+
+    def _get_entity(self, kind: str, entity_id: str) -> Category | Brand | None:
+        collection = self._categories if kind == "category" else self._brands
+        factory = Category if kind == "category" else Brand
+        doc = collection.find_one({"_id": entity_id})
+        return factory(id=doc["_id"], name=doc["name"]) if doc is not None else None
+
+    def _rename_entity(self, kind: str, entity_id: str, new_name: str) -> Category | Brand:
+        collection = self._categories if kind == "category" else self._brands
+        names = self._category_names if kind == "category" else self._brand_names
+        factory = Category if kind == "category" else Brand
+        current = collection.find_one({"_id": entity_id})
+        if current is None:
+            raise EntityNotFoundError(f"{kind} id {entity_id!r} not found")
+        trimmed = new_name.strip()
+        if trimmed == current["name"]:
+            return factory(id=entity_id, name=trimmed)
+        collection.update_one({"_id": entity_id}, {"$set": {"name": trimmed}})
+        names.delete_one({"_id": current["name"], "entity_id": entity_id})
+        names.replace_one(
+            {"_id": trimmed}, {"_id": trimmed, "entity_id": entity_id}, upsert=True
+        )
+        return factory(id=entity_id, name=trimmed)
+
+    def _delete_entity(self, kind: str, entity_id: str) -> int:
+        collection = self._categories if kind == "category" else self._brands
+        names = self._category_names if kind == "category" else self._brand_names
+        ref_field = f"{kind}_id"
+        current = collection.find_one({"_id": entity_id})
+        if current is None:
+            raise EntityNotFoundError(f"{kind} id {entity_id!r} not found")
+        affected = self._products.update_many(
+            {ref_field: entity_id}, {"$set": {ref_field: None}}
+        ).modified_count
+        collection.delete_one({"_id": entity_id})
+        names.delete_one({"_id": current["name"], "entity_id": entity_id})
+        return affected
 
     def list_categories(self) -> list[Category]:
         """Return every category, sorted by name ascending (codepoint order).
@@ -145,7 +440,7 @@ class MongoProductRepository(ProductRepository):
         unknown name.
         """
         LOGGER.info("list_categories()")
-        raise NotImplementedError("TODO: implement 'list_categories' using MongoDB")
+        return self._list_entities("category")
 
     def get_category(self, category_id: str) -> Category | None:
         """Return the category with ``category_id`` or ``None``.
@@ -154,7 +449,7 @@ class MongoProductRepository(ProductRepository):
         are created implicitly when products are saved with an unknown name.
         """
         LOGGER.info("get_category(%r)", category_id)
-        raise NotImplementedError("TODO: implement 'get_category' using MongoDB")
+        return self._get_entity("category", category_id)
 
     def rename_category(self, category_id: str, new_name: str) -> Category:
         """Rename the category; ``new_name`` is trimmed.
@@ -168,7 +463,7 @@ class MongoProductRepository(ProductRepository):
         Returns the renamed entity.
         """
         LOGGER.info("rename_category(%r, %r)", category_id, new_name)
-        raise NotImplementedError("TODO: implement 'rename_category' using MongoDB")
+        return self._rename_entity("category", category_id, new_name)
 
     def delete_category(self, category_id: str) -> int:
         """Delete the category; returns the number of products affected.
@@ -180,7 +475,7 @@ class MongoProductRepository(ProductRepository):
         category.
         """
         LOGGER.info("delete_category(%r)", category_id)
-        raise NotImplementedError("TODO: implement 'delete_category' using MongoDB")
+        return self._delete_entity("category", category_id)
 
     def list_brands(self) -> list[Brand]:
         """Return every brand, sorted by name ascending (codepoint order).
@@ -189,7 +484,7 @@ class MongoProductRepository(ProductRepository):
         name.
         """
         LOGGER.info("list_brands()")
-        raise NotImplementedError("TODO: implement 'list_brands' using MongoDB")
+        return self._list_entities("brand")
 
     def get_brand(self, brand_id: str) -> Brand | None:
         """Return the brand with ``brand_id`` or ``None``.
@@ -198,7 +493,7 @@ class MongoProductRepository(ProductRepository):
         created implicitly when products are saved with an unknown name.
         """
         LOGGER.info("get_brand(%r)", brand_id)
-        raise NotImplementedError("TODO: implement 'get_brand' using MongoDB")
+        return self._get_entity("brand", brand_id)
 
     def rename_brand(self, brand_id: str, new_name: str) -> Brand:
         """Rename the brand; ``new_name`` is trimmed.
@@ -212,7 +507,7 @@ class MongoProductRepository(ProductRepository):
         the renamed entity.
         """
         LOGGER.info("rename_brand(%r, %r)", brand_id, new_name)
-        raise NotImplementedError("TODO: implement 'rename_brand' using MongoDB")
+        return self._rename_entity("brand", brand_id, new_name)
 
     def delete_brand(self, brand_id: str) -> int:
         """Delete the brand; returns the number of products affected.
@@ -224,4 +519,4 @@ class MongoProductRepository(ProductRepository):
         brand.
         """
         LOGGER.info("delete_brand(%r)", brand_id)
-        raise NotImplementedError("TODO: implement 'delete_brand' using MongoDB")
+        return self._delete_entity("brand", brand_id)
