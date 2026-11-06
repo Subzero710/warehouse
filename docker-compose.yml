@@ -8,7 +8,7 @@ services:
       - "--maxConns"
       - "${MONGO_MAX_CONN:-100}"
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -18,7 +18,23 @@ services:
       retries: 5
       start_period: 15s
 
+  app:
+    build: .
+    working_dir: /app
+    command: ["python", "run.py"]
+    environment:
+      STORE_BACKEND: mongo
+      MONGO_URI: "mongodb://mongodb:27017"
+      MONGO_DB: warehouse
+      MONGO_TEST_URI: "mongodb://mongodb:27017?serverMonitoringMode=poll"
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./:/app
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
 volumes:
   mongo-data:
-    # Pinned so the data volume keeps its identity across project renames.
     name: warehouse-mongo-data

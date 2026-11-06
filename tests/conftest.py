@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import os
+
 import pytest
 
 from memory_repository import InMemoryProductRepository
@@ -27,7 +29,7 @@ from repository import ProductRepository
 # up to 60 s (the pool's idle reaper). The suite creates two clients per
 # test, so the leftovers would accumulate and hit mongod's maxConns; poll
 # mode makes the monitor connection short-lived, so close() releases all.
-TEST_URI = "mongodb://localhost:27017?serverMonitoringMode=poll"
+TEST_URI = os.environ["MONGO_TEST_URI"]
 TEST_DB = "warehouse_test"
 
 
