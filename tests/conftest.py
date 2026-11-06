@@ -22,7 +22,12 @@ from memory_repository import InMemoryProductRepository
 from models import Brand, Category, Product
 from repository import ProductRepository
 
-TEST_URI = "mongodb://localhost:27017"
+# serverMonitoringMode=poll: in the default "stream" mode each client keeps
+# a dedicated monitor connection open, and it survives client.close() for
+# up to 60 s (the pool's idle reaper). The suite creates two clients per
+# test, so the leftovers would accumulate and hit mongod's maxConns; poll
+# mode makes the monitor connection short-lived, so close() releases all.
+TEST_URI = "mongodb://localhost:27017?serverMonitoringMode=poll"
 TEST_DB = "warehouse_test"
 
 

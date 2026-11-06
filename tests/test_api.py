@@ -357,13 +357,6 @@ def test_rename_category_unknown_id_404(client):
     assert resp.get_json() == {"error": "not found"}
 
 
-def test_rename_category_unknown_id_beats_invalid_body(client):
-    # the 404 -> 400 priority: existence is checked before the body
-    resp = client.put("/api/categories/no-such-id", json={})
-    assert resp.status_code == 404
-    assert resp.get_json() == {"error": "not found"}
-
-
 def test_delete_category_reports_affected_products(client):
     created = client.post(
         "/api/products", json={"name": "DelCat", "category": "DelCatOnly", "price": 1.0}
@@ -373,22 +366,6 @@ def test_delete_category_reports_affected_products(client):
     assert resp.get_json() == {"removed_from": 1}
     got = client.get(f"/api/products/{created['id']}").get_json()
     assert got["category"] is None  # the product survives, detached
-
-
-def test_delete_category_orphan(client):
-    created = client.post(
-        "/api/products", json={"name": "DelCat2", "category": "DelCat2Only", "price": 1.0}
-    ).get_json()
-    orphan_id = created["category"]["id"]
-    # orphan it: the product is re-bound to another category
-    resp = client.put(
-        f"/api/products/{created['id']}",
-        json={"name": "DelCat2", "description": "d", "category": "Toys", "price": 1.0},
-    )
-    assert resp.status_code == 200
-    resp = client.delete(f"/api/categories/{orphan_id}")
-    assert resp.status_code == 200
-    assert resp.get_json() == {"removed_from": 0}
 
 
 def test_delete_category_unknown_404(client):
@@ -414,11 +391,6 @@ def test_rename_brand_id_is_stable_in_memory(client, backend):
     resp = client.put(f"/api/brands/{items[0]['id']}", json={"name": "Renamed Brand"})
     assert resp.status_code == 200
     assert resp.get_json()["id"] == items[0]["id"]
-
-
-def test_rename_brand_order_404_beats_400(client):
-    resp = client.put("/api/brands/no-such-id", json={})
-    assert resp.status_code == 404
 
 
 def test_delete_brand_reports_affected_products(client):

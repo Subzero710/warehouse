@@ -7,8 +7,19 @@ For each scenario, ONE request is issued as an unmeasured warmup, then
 wall-clock time (connect + full body read), in milliseconds. No request is
 retried: each sample is one real round-trip.
 
-Scenario 5 is a two-phase PUT scenario: rename one category to a temporary
-name (phase "rename"), then rename it back to the original name (phase
+The filter scenarios time one GET /api/products request per access pattern:
+by category name, by brand name, and by product name (``search_text``).
+Each resolves its lookup value once at startup — the first category name
+from /api/categories, the first brand name from /api/brands, and the full
+name of the first product of the page-1 response — and requests page 1
+with the default page size. The displayed label shows a ``<name>``
+placeholder; the real value is percent-encoded into the path. A filter
+scenario is skipped when its value cannot be resolved (empty catalog, no
+category / brand, or a blank category / brand name).
+
+The rename scenario performs a two-phase PUT: rename one category to a
+temporary name (phase "rename"), then rename it back to the original name
+(phase
 "restore"), leaving a clean state afterwards. Each phase follows the usual
 1-warmup + N-measured pattern, and EVERY measured PUT performs a real
 rename: before each measured PUT the category's current id is re-resolved
@@ -18,11 +29,11 @@ restores the starting state before the next sample. The temporary name is
 chosen ONCE before the runs: it is the original name plus " (bench)"; when
 that exact name is already taken a counter grows — " (bench-2)",
 " (bench-3)", ... — until the candidate is outside the current name set.
-After scenario 5 the script re-fetches
+After the rename scenario the script re-fetches
 the category list: if the sorted name list no longer matches the one
-captured before scenario 5, an error is printed and the process exits with
-code 2. When the category list is empty, scenario 5 prints "skip" and the
-run exits with code 0.
+captured before it, an error is printed and the process exits with
+code 2. When the category list is empty, the rename scenario prints "skip"
+and the run exits with code 0.
 
 Usage:
     python bench.py [--url http://localhost:5000] [--runs 5]
@@ -108,16 +119,18 @@ def _resolve_category_id_by_name(base_url: str, name: str) -> str:
 
 
 def _resolve_scenarios(base_url: str) -> tuple[list[tuple[str, str]], dict | None, list[str]]:
-    """Resolve the GET scenarios plus the scenario-5 probe state.
+    """Resolve the GET scenarios plus the rename-scenario probe state.
 
     Returns ``(get_scenarios, first_category, initial_names)``: the
     (name, path) pairs handled by the generic loop, the first category of
-    the scenario-3 response (``None`` when the list is empty), and the
-    sorted category name list captured before scenario 5 runs. The pre-run
-    probe requests are NOT part of any scenario's warmup or measured runs.
+    the /api/categories response (``None`` when the list is empty), and the
+    sorted category name list captured before the rename scenario runs.
+    The pre-run probe requests are NOT part of any scenario's warmup or
+    measured runs.
     """
     page1 = _get_json(base_url, "/api/products?page=1")
     categories = _get_json(base_url, "/api/categories")
+    brands = _get_json(base_url, "/api/brands")
 
     scenarios: list[tuple[str, str]] = []
     first_item = (page1.get("items") or [None])[0]
@@ -125,6 +138,14 @@ def _resolve_scenarios(base_url: str) -> tuple[list[tuple[str, str]], dict | Non
         product_path = f"/api/products/{first_item['id']}"
         scenarios.append(("GET /api/products?page=1 (list)", "/api/products?page=1"))
         scenarios.append((f"GET {product_path.replace(first_item['id'], '<id>')}", product_path))
+        search_path = f"/api/products?search_text={quote(first_item['name'], safe='')}&page=1"
+        scenarios.append(("GET /api/products?search_text=<name>&page=1", search_path))
+    if categories and categories[0]["name"].strip():
+        category_path = f"/api/products?category={quote(categories[0]['name'], safe='')}&page=1"
+        scenarios.append(("GET /api/products?category=<name>&page=1", category_path))
+    if brands and brands[0]["name"].strip():
+        brand_path = f"/api/products?brand={quote(brands[0]['name'], safe='')}&page=1"
+        scenarios.append(("GET /api/products?brand=<name>&page=1", brand_path))
     scenarios.append(("GET /api/categories", "/api/categories"))
     scenarios.append(("GET /api/products/stats", "/api/products/stats"))
 
@@ -148,7 +169,7 @@ def _rename_put(base_url: str, current_name: str, new_name: str) -> float:
 
 
 def _run_rename_scenario(base_url: str, runs: int, category: dict, initial_names: list[str]) -> int:
-    """Scenario 5: rename one category to a temporary name and restore it.
+    """Rename scenario: rename one category to a temporary name and restore it.
 
     Two PUT phases (rename to the temporary name, rename back to the
     original), timed separately with the usual 1 warmup + N measured runs
@@ -188,8 +209,9 @@ def _run_rename_scenario(base_url: str, runs: int, category: dict, initial_names
 def run_bench(base_url: str, runs: int) -> int:
     """Run every scenario, print a summary, and return the process exit code.
 
-    Exit code: 0 on success (including a skipped scenario 5), 2 when the
-    final self-check finds the category state altered by scenario 5.
+    Exit code: 0 on success (including a skipped rename scenario), 2 when
+    the final self-check finds the category state altered by the rename
+    scenario.
     """
     scenarios, first_category, initial_names = _resolve_scenarios(base_url)
     header = (

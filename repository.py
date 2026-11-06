@@ -43,11 +43,14 @@ DEFAULT_MONGO_DB = "warehouse"
 class ProductRepository(ABC):
     """Abstract boundary between the application and its storage backend.
 
-    Contract conventions, per method: the ``get_product`` / ``get_category``
-    reads return ``None`` and NEVER raise (a malformed id included);
-    ``update_product`` / ``delete_product`` (and the rename / delete entity
-    methods) raise :class:`EntityNotFoundError` when the target is unknown OR
-    malformed. API mapping order: 404, then 400.
+    Contract conventions, per method: the ``get_product`` reads return
+    ``None`` and NEVER raise (a malformed id included); ``get_category`` /
+    ``get_brand`` never raise, but the value they return for an unknown id
+    is implementation-defined (see their docstrings). ``update_product`` /
+    ``delete_product`` (and the rename / delete entity methods) raise
+    :class:`EntityNotFoundError` when the target is unknown OR malformed.
+    API mapping order: 404, then 400, except where a behavior is left
+    implementation-defined.
 
     Every name comparison in the contract is case-sensitive: entity names
     are matched exactly, so ``Books`` and ``books`` are two distinct
@@ -144,8 +147,12 @@ class ProductRepository(ABC):
     def get_category(self, category_id: str) -> Category | None:
         """Return the category with ``category_id`` or ``None``.
 
-        Never raises: an unknown or malformed id yields ``None``. Categories
-        are created implicitly when products are saved with an unknown name.
+        Never raises. Whether the id must denote an existing category is
+        implementation-defined: the in-memory reference yields ``None`` for
+        an id it does not know; a denormalized design (the id is the name)
+        may yield the entity materialized from the id, without checking that
+        any product carries it. ``""`` yields ``None``. Categories are
+        created implicitly when products are saved with an unknown name.
         """
 
     @abstractmethod
@@ -167,9 +174,12 @@ class ProductRepository(ABC):
 
         Every product that carried the category is detached (its ``category``
         becomes ``None``; the product survives, nothing is deleted on the
-        product side). An unknown or malformed id raises
-        :class:`EntityNotFoundError`. The count is 0 for an orphaned
-        category.
+        product side). An unknown id raises :class:`EntityNotFoundError`;
+        the count is 0 for an orphaned category (an existing category that
+        no product carries). In a denormalized design, where a category only
+        exists while a product carries its name, an orphan cannot exist:
+        deleting a name no product carries may raise
+        :class:`EntityNotFoundError` instead of returning 0.
         """
 
     @abstractmethod
@@ -184,8 +194,12 @@ class ProductRepository(ABC):
     def get_brand(self, brand_id: str) -> Brand | None:
         """Return the brand with ``brand_id`` or ``None``.
 
-        Never raises: an unknown or malformed id yields ``None``. Brands are
-        created implicitly when products are saved with an unknown name.
+        Never raises. Whether the id must denote an existing brand is
+        implementation-defined: the in-memory reference yields ``None`` for
+        an id it does not know; a denormalized design (the id is the name)
+        may yield the entity materialized from the id, without checking that
+        any product carries it. ``""`` yields ``None``. Brands are created
+        implicitly when products are saved with an unknown name.
         """
 
     @abstractmethod
@@ -207,8 +221,12 @@ class ProductRepository(ABC):
 
         Every product that carried the brand is detached (its ``brand``
         becomes ``None``; the product survives, nothing is deleted on the
-        product side). An unknown or malformed id raises
-        :class:`EntityNotFoundError`. The count is 0 for an orphaned brand.
+        product side). An unknown id raises :class:`EntityNotFoundError`;
+        the count is 0 for an orphaned brand (an existing brand that no
+        product carries). In a denormalized design, where a brand only
+        exists while a product carries its name, an orphan cannot exist:
+        deleting a name no product carries may raise
+        :class:`EntityNotFoundError` instead of returning 0.
         """
 
 

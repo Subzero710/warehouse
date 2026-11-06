@@ -126,9 +126,15 @@ pytest -xvv --log-level INFO --log-cli-level INFO
 
 Le script `bench.py` (bibliothèque standard uniquement) mesure les temps de
 réponse de l'API : moyenne / min / max en millisecondes sur N allers-retours
-par scénario. L'API doit être en cours d'exécution, et idéalement alimentée
-par `seed.py` : sur un catalogue vide, les scénarios de liste et de
-consultation d'un produit sont ignorés.
+par scénario. Outre la liste, la consultation d'un produit par identifiant,
+la liste des catégories et les statistiques, il mesure trois scénarios de
+recherche : par catégorie, par marque et par nom (`search_text`). Chaque
+scénario résout une valeur concrète au démarrage (première catégorie,
+première marque, nom complet du premier produit de la page 1) ; c'est le
+terrain de comparaison idéal pour évaluer l'impact des index MongoDB.
+L'API doit être en cours d'exécution, et idéalement alimentée par `seed.py`
+: sur un catalogue vide, les scénarios de liste, de consultation et de
+recherche sont ignorés.
 
 ```bash
 python bench.py --url http://localhost:5000 --runs 5

@@ -6,7 +6,7 @@ services:
       - "--wiredTigerCacheSizeGB"
       - "${MONGO_CACHE_GB:-0.5}"
       - "--maxConns"
-      - "${MONGO_MAX_CONN:-25}"
+      - "${MONGO_MAX_CONN:-100}"
     ports:
       - "27017:27017"
     volumes:
