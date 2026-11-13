@@ -84,8 +84,14 @@ class MongoProductRepository(ProductRepository):
             "_id": product_id,
             "name": product.name,
             "description": product.description,
-            "category_id": category.id if category is not None else None,
-            "brand_id": brand.id if brand is not None else None,
+            "category": (
+                {"id": category.id, "name": category.name}
+                if category is not None else None
+            ),
+            "brand": (
+                {"id": brand.id, "name": brand.name}
+                if brand is not None else None
+            ),
             "price": product.price,
             "stock": product.stock,
             "rating": product.rating,
