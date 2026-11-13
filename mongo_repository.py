@@ -1,9 +1,4 @@
-"""MongoDB implementation of the product repository contract.
-
-Products store stable category/brand references. Their names are resolved from
-entity collections on reads, so renaming an entity does not rewrite products.
-Filtering, sorting, pagination and statistics are performed by MongoDB.
-"""
+"""MongoDB product repository with embedded category and brand data."""
 
 from __future__ import annotations
 
@@ -101,16 +96,10 @@ class MongoProductRepository(ProductRepository):
 
     @staticmethod
     def _product_from_document(doc: dict) -> Product:
-        category_docs = doc.get("_joined_category", [])
-        brand_docs = doc.get("_joined_brand", [])
-        category = (
-            Category(id=category_docs[0]["_id"], name=category_docs[0]["name"])
-            if category_docs else None
-        )
-        brand = (
-            Brand(id=brand_docs[0]["_id"], name=brand_docs[0]["name"])
-            if brand_docs else None
-        )
+        category_data = doc["category"]
+        brand_data = doc["brand"]
+        category = Category(**category_data) if category_data is not None else None
+        brand = Brand(**brand_data) if brand_data is not None else None
         return Product(
             id=doc["_id"],
             name=doc["name"],
@@ -123,23 +112,6 @@ class MongoProductRepository(ProductRepository):
             units_sold=doc["units_sold"],
             created_at=doc["created_at"],
         )
-
-    @staticmethod
-    def _joins() -> list[dict]:
-        return [
-            {"$lookup": {
-                "from": CATEGORY_COLLECTION_NAME,
-                "localField": "category_id",
-                "foreignField": "_id",
-                "as": "_joined_category",
-            }},
-            {"$lookup": {
-                "from": BRAND_COLLECTION_NAME,
-                "localField": "brand_id",
-                "foreignField": "_id",
-                "as": "_joined_brand",
-            }},
-        ]
 
     def create_product(self, product: Product) -> Product:
         """Create a single product.
@@ -204,10 +176,7 @@ class MongoProductRepository(ProductRepository):
         Never raises: an unknown or malformed id yields ``None``.
         """
         LOGGER.info("get_product(%r)", product_id)
-        records = self._products.aggregate(
-            [{"$match": {"_id": product_id}}, {"$limit": 1}, *self._joins()]
-        )
-        doc = next(records, None)
+        doc = self._products.find_one({"_id": product_id})
         return self._product_from_document(doc) if doc is not None else None
 
     def update_product(self, product: Product) -> Product:
@@ -255,17 +224,9 @@ class MongoProductRepository(ProductRepository):
         LOGGER.info("list_products(%r)", query)
         conditions = []
         if query.category is not None:
-            category_ids = [
-                doc["_id"]
-                for doc in self._categories.find({"name": query.category}, {"_id": 1})
-            ]
-            conditions.append({"category_id": {"$in": category_ids}})
+            conditions.append({"category.name": query.category})
         if query.brand is not None:
-            brand_ids = [
-                doc["_id"]
-                for doc in self._brands.find({"name": query.brand}, {"_id": 1})
-            ]
-            conditions.append({"brand_id": {"$in": brand_ids}})
+            conditions.append({"brand.name": query.brand})
         if query.price_min is not None or query.price_max is not None:
             bounds = {}
             if query.price_min is not None:
@@ -292,14 +253,13 @@ class MongoProductRepository(ProductRepository):
         page_size = max(1, min(100, query.page_size))
         total_pages = (total + page_size - 1) // page_size if total else 0
         direction = ASCENDING if query.sort_ascending else DESCENDING
-        pipeline = [
-            {"$match": predicate},
-            {"$sort": {query.sort_field: direction, "_id": ASCENDING}},
-            {"$skip": (page - 1) * page_size},
-            {"$limit": page_size},
-            *self._joins(),
-        ]
-        items = [self._product_from_document(doc) for doc in self._products.aggregate(pipeline)]
+        cursor = (
+            self._products.find(predicate)
+            .sort([(query.sort_field, direction), ("_id", ASCENDING)])
+            .skip((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = [self._product_from_document(doc) for doc in cursor]
         return ProductPage(
             items=items, total=total, page=page,
             page_size=page_size, total_pages=total_pages,
@@ -333,25 +293,12 @@ class MongoProductRepository(ProductRepository):
                 "average_price": {"$avg": "$price"},
             }}],
             "categories": [
-                {"$match": {"category_id": {"$ne": None}}},
+                {"$match": {"category.name": {"$type": "string"}}},
                 {"$group": {
-                    "_id": "$category_id",
+                    "_id": "$category.name",
                     "count": {"$sum": 1},
                     "sum_price": {"$sum": "$price"},
                     "total_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
-                }},
-                {"$lookup": {
-                    "from": CATEGORY_COLLECTION_NAME,
-                    "localField": "_id", "foreignField": "_id", "as": "category",
-                }},
-                {"$unwind": "$category"},
-                # Different ids can share a name after a rename. Stats are
-                # grouped by the current name, not by entity id.
-                {"$group": {
-                    "_id": "$category.name",
-                    "count": {"$sum": "$count"},
-                    "sum_price": {"$sum": "$sum_price"},
-                    "total_value": {"$sum": "$total_value"},
                 }},
                 {"$project": {
                     "count": 1,
@@ -386,8 +333,10 @@ class MongoProductRepository(ProductRepository):
         for field in ("name", "price", "rating", "units_sold", "created_at"):
             for direction in (ASCENDING, DESCENDING):
                 self._products.create_index([(field, direction), ("_id", ASCENDING)])
-        self._products.create_index([("category_id", ASCENDING)])
-        self._products.create_index([("brand_id", ASCENDING)])
+        self._products.create_index([("category.name", ASCENDING)])
+        self._products.create_index([("brand.name", ASCENDING)])
+        self._products.create_index([("category.id", ASCENDING)])
+        self._products.create_index([("brand.id", ASCENDING)])
         self._categories.create_index([("name", ASCENDING)])
         self._brands.create_index([("name", ASCENDING)])
         # category_names/brand_names already have unique _id indexes.
@@ -423,17 +372,19 @@ class MongoProductRepository(ProductRepository):
         names.replace_one(
             {"_id": trimmed}, {"_id": trimmed, "entity_id": entity_id}, upsert=True
         )
+        self._products.update_many(
+            {f"{kind}.id": entity_id}, {"$set": {f"{kind}.name": trimmed}}
+        )
         return factory(id=entity_id, name=trimmed)
 
     def _delete_entity(self, kind: str, entity_id: str) -> int:
         collection = self._categories if kind == "category" else self._brands
         names = self._category_names if kind == "category" else self._brand_names
-        ref_field = f"{kind}_id"
         current = collection.find_one({"_id": entity_id})
         if current is None:
             raise EntityNotFoundError(f"{kind} id {entity_id!r} not found")
         affected = self._products.update_many(
-            {ref_field: entity_id}, {"$set": {ref_field: None}}
+            {f"{kind}.id": entity_id}, {"$set": {kind: None}}
         ).modified_count
         collection.delete_one({"_id": entity_id})
         names.delete_one({"_id": current["name"], "entity_id": entity_id})
