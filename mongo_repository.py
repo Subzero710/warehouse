@@ -269,23 +269,26 @@ class MongoProductRepository(ProductRepository):
         """
         LOGGER.info("get_stats()")
         result = next(self._products.aggregate([{"$facet": {
-            "overall": [{"$group": {
-                "_id": None,
-                "total": {"$sum": 1},
-                "average_price": {"$avg": "$price"},
-            }}],
+            "overall": [
+                {"$project": {"price": 1}},
+                {"$group": {
+                    "_id": None,
+                    "total": {"$sum": 1},
+                    "average_price": {"$avg": "$price"},
+                }},
+            ],
             "categories": [
                 {"$match": {"category": {"$type": "string"}}},
+                {"$project": {
+                    "category": 1,
+                    "price": 1,
+                    "total_value": {"$multiply": ["$price", "$stock"]},
+                }},
                 {"$group": {
                     "_id": "$category",
                     "count": {"$sum": 1},
-                    "sum_price": {"$sum": "$price"},
-                    "total_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
-                }},
-                {"$project": {
-                    "count": 1,
-                    "average_price": {"$divide": ["$sum_price", "$count"]},
-                    "total_value": 1,
+                    "average_price": {"$avg": "$price"},
+                    "total_value": {"$sum": "$total_value"},
                 }},
                 {"$sort": {"_id": 1}},
             ],
