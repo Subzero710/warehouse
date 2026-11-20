@@ -1,42 +1,47 @@
-"""Tests for embedded category and brand fields."""
+"""MongoDB schema tests."""
 
 import pytest
 
 
-def test_raw_product_has_embedded_category_and_brand(repo, backend):
+@pytest.fixture
+def mongo_repo(repo, backend):
     if backend != "mongo":
         pytest.skip("MongoDB storage format only")
-    doc = repo._products.find_one({"name": "Zebra42 Widget"})
-    assert doc["category"] == {"id": doc["category"]["id"], "name": "Books"}
-    assert doc["brand"] == {"id": doc["brand"]["id"], "name": "Acme"}
+    return repo
+
+
+def test_product_stores_category_and_brand_as_strings(mongo_repo):
+    doc = mongo_repo._products.find_one({"name": "Zebra42 Widget"})
+    assert doc["category"] == "Books"
+    assert doc["brand"] == "Acme"
     assert "category_id" not in doc and "brand_id" not in doc
-    empty = repo._products.find_one({"name": "Naked Gadget"})
+    empty = mongo_repo._products.find_one({"name": "Naked Gadget"})
     assert empty["category"] is None and empty["brand"] is None
+    assert mongo_repo._db.list_collection_names() == ["product"]
 
 
-def test_rename_and_delete_propagate_into_documents(repo, backend):
-    if backend != "mongo":
-        pytest.skip("MongoDB storage format only")
-    product = repo._products.find_one({"name": "Zebra42 Widget"})
-    category_id = product["category"]["id"]
-    brand_id = product["brand"]["id"]
-    repo.rename_category(category_id, "Literature")
-    repo.rename_brand(brand_id, "Acme Corp")
-    updated = repo._products.find_one({"_id": product["_id"]})
-    assert updated["category"] == {"id": category_id, "name": "Literature"}
-    assert updated["brand"] == {"id": brand_id, "name": "Acme Corp"}
-    repo.delete_category(category_id)
-    repo.delete_brand(brand_id)
-    detached = repo._products.find_one({"_id": product["_id"]})
+def test_rename_and_delete_update_product_strings(mongo_repo):
+    product = mongo_repo._products.find_one({"name": "Zebra42 Widget"})
+    category = next(c for c in mongo_repo.list_categories() if c.name == "Books")
+    brand = next(b for b in mongo_repo.list_brands() if b.name == "Acme")
+    renamed_cat = mongo_repo.rename_category(category.id, "Literature")
+    renamed_brand = mongo_repo.rename_brand(brand.id, "Acme Corp")
+    assert mongo_repo.get_category(renamed_cat.id).name == "Literature"
+    assert mongo_repo.get_brand(renamed_brand.id).name == "Acme Corp"
+    updated = mongo_repo._products.find_one({"_id": product["_id"]})
+    assert updated["category"] == "Literature"
+    assert updated["brand"] == "Acme Corp"
+    mongo_repo.delete_category(renamed_cat.id)
+    mongo_repo.delete_brand(renamed_brand.id)
+    detached = mongo_repo._products.find_one({"_id": product["_id"]})
     assert detached["category"] is None
     assert detached["brand"] is None
 
 
-def test_embedded_name_indexes_created(repo, backend):
-    if backend != "mongo":
-        pytest.skip("MongoDB storage format only")
-    repo.ensure_indexes()
-    indexes = repo._products.index_information()
+def test_scalar_indexes(mongo_repo):
+    mongo_repo.ensure_indexes()
+    indexes = mongo_repo._products.index_information()
     keys = [index["key"] for index in indexes.values()]
-    assert [("category.name", 1)] in keys
-    assert [("brand.name", 1)] in keys
+    assert [("category", 1)] in keys
+    assert [("brand", 1)] in keys
+    assert mongo_repo._db.list_collection_names() == ["product"]
